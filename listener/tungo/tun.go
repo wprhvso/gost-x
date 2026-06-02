@@ -2,6 +2,7 @@ package tungo
 
 import (
 	"io"
+	"os"
 
 	"golang.zx2c4.com/wireguard/tun"
 )
@@ -73,6 +74,11 @@ func (d *tunDevice) Close() error {
 }
 
 func (l *tunListener) createTunDevice() (dev io.ReadWriteCloser, name string, err error) {
+	if l.md.config.FD > 0 {
+		f := os.NewFile(uintptr(l.md.config.FD), "tun")
+		return f, l.md.config.Name, nil
+	}
+
 	ifce, err := tun.CreateTUN(l.md.config.Name, l.md.config.MTU)
 	if err != nil {
 		return

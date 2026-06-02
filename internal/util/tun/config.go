@@ -15,4 +15,5 @@ type Config struct {
 	Gateway net.IP
 	Router  router.Router
 	DNS []net.IP
+	FD  int
 }

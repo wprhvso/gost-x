@@ -25,6 +25,14 @@ func (l *tunListener) createTun() (dev io.ReadWriteCloser, name string, ip net.I
 		return
 	}
 
+	if len(l.md.config.Net) > 0 {
+		ip = l.md.config.Net[0].IP
+	}
+
+	if l.md.config.FD > 0 {
+		return dev, name, ip, nil
+	}
+
 	ifce, err := net.InterfaceByName(name)
 	if err != nil {
 		return
@@ -42,9 +50,6 @@ func (l *tunListener) createTun() (dev io.ReadWriteCloser, name string, ip net.I
 			l.log.Error(err)
 			continue
 		}
-	}
-	if len(l.md.config.Net) > 0 {
-		ip = l.md.config.Net[0].IP
 	}
 
 	if err = netlink.LinkSetUp(link); err != nil {

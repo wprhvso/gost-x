@@ -29,6 +29,7 @@ func (l *tunListener) parseMetadata(md mdata.Metadata) (err error) {
 	if config.MTU <= 0 {
 		config.MTU = defaultMTU
 	}
+	config.FD = mdutil.GetInt(md, "fd", "tun.fd")
 	if gw := mdutil.GetString(md, "gw", "tun.gw"); gw != "" {
 		config.Gateway = net.ParseIP(gw)
 	}

@@ -77,14 +77,18 @@ func (l *tunListener) listenLoop(ready context.CancelCauseFunc) {
 				return err
 			}
 
-			itf, err := net.InterfaceByName(name)
-			if err != nil {
-				return err
+			if l.md.config.FD == 0 {
+				itf, err := net.InterfaceByName(name)
+				if err != nil {
+					return err
+				}
+				addrs, _ := itf.Addrs()
+				l.log.Infof("name: %s, net: %s, mtu: %d, addrs: %s",
+					itf.Name, ip, l.md.config.MTU, addrs)
+			} else {
+				l.log.Infof("name: %s, net: %s, mtu: %d, addrs: %s",
+					name, ip, l.md.config.MTU, ip.String())
 			}
-
-			addrs, _ := itf.Addrs()
-			l.log.Infof("name: %s, net: %s, mtu: %d, addrs: %s",
-				itf.Name, ip, l.md.config.MTU, addrs)
 
 			ctx = ictx.ContextWithMetadata(ctx, mdx.NewMetadata(map[string]any{
 				"config": l.md.config,
