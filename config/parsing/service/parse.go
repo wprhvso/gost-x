@@ -29,14 +29,31 @@ import (
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
 	selector_parser "github.com/go-gost/x/config/parsing/selector"
 	tls_util "github.com/go-gost/x/internal/util/tls"
+	quota_wrapper "github.com/go-gost/x/limiter/quota/wrapper"
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
 	mdutil "github.com/go-gost/x/metadata/util"
 	xstats "github.com/go-gost/x/observer/stats"
+	xrecorder "github.com/go-gost/x/recorder"
 	"github.com/go-gost/x/registry"
 	xservice "github.com/go-gost/x/service"
 	"github.com/vishvananda/netns"
 )
+
+// plaintextListeners are listener types that never terminate TLS on their
+// accepted connections, so any certFile/keyFile/caFile configured for them is
+// silently ignored. This catches the common footgun where a user writes e.g.
+// `tls+mws://...?certFile=...` expecting TLS: the "tls+" prefix is parsed as
+// the handler scheme (see x/config/cmd/cmd.go buildServiceConfig), not a TLS
+// wrapper, so the underlying mws listener stays plaintext. Extend this set when
+// new plaintext listeners are added.
+var plaintextListeners = map[string]bool{
+	"tcp": true, "udp": true,
+	"ws": true, "mws": true,
+	"redirect": true, "tproxy": true,
+	"rtcp": true, "rudp": true,
+	"unix": true, "runix": true, "serial": true, "stdio": true,
+}
 
 // ParseService constructs a fully-wired service.Service from a ServiceConfig.
 // It defaults the listener to "tcp" and the handler to "auto", resolves named
@@ -85,6 +102,11 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		tlsConfig = parsing.DefaultTLSConfig().Clone()
 		tls_util.SetTLSOptions(tlsConfig, tlsCfg.Options)
 		tls_util.RejectUnknownSNIConfig(tlsConfig, tlsCfg.RejectUnknownSNI, tlsCfg.ServerNames)
+	}
+
+	if (tlsCfg.CertFile != "" || tlsCfg.KeyFile != "" || tlsCfg.CAFile != "") && plaintextListeners[cfg.Listener.Type] {
+		serviceLogger.Warnf("TLS certificate options are configured but the %q listener does not use TLS and will ignore them; the connection will be plaintext. Use a TLS-capable listener (e.g. mwss, wss, tls, quic, grpc, http2, http3) to enable TLS.",
+			cfg.Listener.Type)
 	}
 
 	authers := auth_parser.List(cfg.Listener.Auther, cfg.Listener.Authers...)
@@ -246,6 +268,10 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		return nil, err
 	}
 
+	for _, qname := range cfg.Quotas {
+		ln = quota_wrapper.WrapListener(ln, strings.TrimSpace(qname))
+	}
+
 	handlerLogger := serviceLogger.WithFields(map[string]any{
 		"kind": "handler",
 	})
@@ -280,8 +306,15 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	var recorders []recorder.RecorderObject
 	for _, r := range cfg.Recorders {
 		md := metadata.NewMetadata(r.Metadata)
+		rec := registry.RecorderRegistry().Get(r.Name)
+		if r.Metadata != nil {
+			rec = &xrecorder.MetadataRecorder{
+				Recorder: rec,
+				Metadata: r.Metadata,
+			}
+		}
 		recorders = append(recorders, recorder.RecorderObject{
-			Recorder: registry.RecorderRegistry().Get(r.Name),
+			Recorder: rec,
 			Record:   r.Record,
 			Options: &recorder.Options{
 				Direction:       mdutil.GetBool(md, parsing.MDKeyRecorderDirection),
@@ -290,6 +323,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 				HTTPBody:        mdutil.GetBool(md, parsing.MDKeyRecorderHTTPBody),
 				MaxBodySize:     mdutil.GetInt(md, parsing.MDKeyRecorderHTTPMaxBodySize),
 			},
+			Metadata: r.Metadata,
 		})
 	}
 
