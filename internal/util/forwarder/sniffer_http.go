@@ -356,6 +356,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 			if re.Pattern.MatchString(req.URL.Path) {
 				if s := re.Pattern.ReplaceAllString(req.URL.Path, re.Replacement); s != "" {
 					req.URL.Path = s
+					ro.HTTP.URI = req.URL.RequestURI()
 					break
 				}
 			}
@@ -368,7 +369,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 
 	// Rewrite request body before wrapping for recording,
 	// so the recorder sees the rewritten content.
-	if err = rewriteReqBody(req, reqBodyRewrites...); err != nil {
+	if err = rewriteReqBody(ctx, req, reqBodyRewrites...); err != nil {
 		log.Errorf("rewrite request body: %v", err)
 		return
 	}
@@ -445,7 +446,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		resp.Header.Set("Connection", "close")
 	}
 
-	if err = rewriteRespBody(resp, respBodyRewrites...); err != nil {
+	if err = rewriteRespBody(ctx, resp, respBodyRewrites...); err != nil {
 		log.Errorf("rewrite body: %v", err)
 		return
 	}
@@ -471,3 +472,4 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 
 	return
 }
+

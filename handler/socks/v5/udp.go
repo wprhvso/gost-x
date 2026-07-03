@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/go-gost/core/hosts"
@@ -53,7 +55,7 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, network st
 		Netns: h.options.Netns,
 	}
 
-	cc, err := lc.ListenPacket(ctx, network, net.JoinHostPort(host, "0"))
+	cc, err := listenPacketInRange(ctx, &lc, network, host, h.md.udpBindMin, h.md.udpBindMax)
 	if err != nil {
 		log.Error(err)
 		reply := gosocks5.NewReply(gosocks5.Failure, nil)
@@ -91,6 +93,21 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, network st
 		log.Trace(reply)
 		reply.Write(conn)
 		return err
+	}
+
+	// A direct (no-chain) UDP association yields a raw *net.UDPConn, which
+	// cannot consume the domainAddr returned by udpConn.ReadFrom for
+	// ATYP=DOMAINNAME datagrams. Wrap it so domains are resolved through the
+	// configured resolver (hostMapper → resolver → system DNS) instead of the
+	// previous hardcoded net.ResolveUDPAddr in the SOCKS5 decode path.
+	// Chain-backed PacketConns (udpTunConn, udpRelayConn, ...) encode domains
+	// as ATYP=Domain themselves and are left untouched.
+	if _, isDirect := pc.(*net.UDPConn); isDirect {
+		pc = &resolvePacketConn{
+			PacketConn:  pc,
+			resolver:    h.options.Router.Options().Resolver,
+			hostMapper:  h.options.Router.Options().HostMapper,
+		}
 	}
 
 	saddr := gosocks5.Addr{}
@@ -179,6 +196,37 @@ func (h *socks5Handler) handleUDP(ctx context.Context, conn net.Conn, network st
 	return nil
 }
 
+// listenPacketInRange binds the client-facing UDP relay socket. When lo..hi is
+// a valid range (lo > 0, hi >= lo) it scans ports from a random offset within
+// [lo, hi] and retries on EADDRINUSE, so a NAT router can forward a small,
+// fixed port set to the SOCKS server. The random offset avoids every
+// association hammering port lo under concurrency; the rotation visits distinct
+// ports, so a free port is always found when the range fits the attempt cap.
+// RFC 1928 leaves relay-port selection to the server; the caller still reports
+// the actually-bound port via BND.PORT. With no range, the OS chooses (port 0).
+// A non-EADDRINUSE error fails fast.
+func listenPacketInRange(ctx context.Context, lc *xnet.ListenConfig, network, host string, lo, hi int) (net.PacketConn, error) {
+	if lo > 0 && hi >= lo {
+		span := hi - lo + 1
+		attempts := min(span, 64)
+		offset := rand.IntN(span)
+		var lastErr error
+		for i := range attempts {
+			port := lo + (offset+i)%span
+			cc, err := lc.ListenPacket(ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
+			if err == nil {
+				return cc, nil
+			}
+			lastErr = err
+			if !errors.Is(err, syscall.EADDRINUSE) {
+				return nil, err
+			}
+		}
+		return nil, lastErr
+	}
+	return lc.ListenPacket(ctx, network, net.JoinHostPort(host, "0"))
+}
+
 // filteredPacketConn implements SOCKS5 RFC 1928 UDP relay security by filtering
 // incoming packets to only accept those from the client IP that established the TCP control connection.
 type filteredPacketConn struct {
@@ -201,6 +249,55 @@ func (f *filteredPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error
 			return
 		}
 	}
+}
+
+// resolvePacketConn wraps the upstream net.PacketConn for a direct (no-chain)
+// UDP association and resolves domain addresses to IPs in WriteTo calls.
+//
+// udpConn.ReadFrom now returns a domainAddr for ATYP=DOMAINNAME datagrams so
+// the domain survives to the chain; a raw *net.UDPConn cannot consume a
+// domainAddr (WriteTo needs *net.UDPAddr), so direct connections are wrapped
+// here. Resolution order is hostMapper → configured resolver → system DNS, so a
+// configured resolver (e.g. resolver=1.1.1.1) is honored instead of leaking
+// through the system resolver.
+type resolvePacketConn struct {
+	net.PacketConn
+	resolver   resolver.Resolver
+	hostMapper hosts.HostMapper
+}
+
+func (c *resolvePacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	host, portStr, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return c.PacketConn.WriteTo(b, addr)
+	}
+	if net.ParseIP(host) != nil {
+		return c.PacketConn.WriteTo(b, addr)
+	}
+
+	var ips []net.IP
+	if c.hostMapper != nil {
+		ips, _ = c.hostMapper.Lookup(context.Background(), "ip", host)
+	}
+	if len(ips) == 0 && c.resolver != nil {
+		ips, _ = c.resolver.Resolve(context.Background(), "ip", host)
+	}
+	if len(ips) == 0 {
+		ips, _ = net.LookupIP(host)
+	}
+	if len(ips) == 0 {
+		return 0, fmt.Errorf("socks5 udp: cannot resolve %s", host)
+	}
+
+	ip := ips[0]
+	for _, candidate := range ips {
+		if candidate.To4() != nil {
+			ip = candidate
+			break
+		}
+	}
+	port, _ := strconv.Atoi(portStr)
+	return c.PacketConn.WriteTo(b, &net.UDPAddr{IP: ip, Port: port})
 }
 
 // domainResolvePacketConn wraps a net.PacketConn and resolves domain

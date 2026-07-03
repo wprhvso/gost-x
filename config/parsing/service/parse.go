@@ -11,6 +11,7 @@ import (
 	"github.com/go-gost/core/handler"
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/listener"
+	"github.com/go-gost/core/rewriter"
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
@@ -303,6 +304,32 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		auther = xauth.AuthenticatorGroup(authers...)
 	}
 
+	// Parse skipauth from handler metadata to whitelist client IPs that
+	// should bypass authentication. Accepts both YAML arrays
+	// (skipauth: ["10.0.0.0/8"]) and comma-separated URL query values
+	// (?skipauth=10.0.0.0/8,192.168.1.1).
+	if cfg.Handler.Metadata != nil {
+		hmd := metadata.NewMetadata(cfg.Handler.Metadata)
+		skipauth := mdutil.GetStrings(hmd, "skipauth")
+		if len(skipauth) == 0 {
+			if s := mdutil.GetString(hmd, "skipauth"); s != "" {
+				for _, p := range strings.Split(s, ",") {
+					if p = strings.TrimSpace(p); p != "" {
+						skipauth = append(skipauth, p)
+					}
+				}
+			}
+		}
+		if len(skipauth) > 0 {
+			if auther != nil {
+				auther = xauth.WhitelistedAuthenticator(auther, skipauth)
+				handlerLogger.Debugf("skipauth whitelist applied: %v", skipauth)
+			} else {
+				handlerLogger.Warnf("skipauth configured but no auther set — authentication is already disabled for all clients")
+			}
+		}
+	}
+
 	var recorders []recorder.RecorderObject
 	for _, r := range cfg.Recorders {
 		md := metadata.NewMetadata(r.Metadata)
@@ -325,6 +352,14 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 			},
 			Metadata: r.Metadata,
 		})
+	}
+
+	var rew rewriter.Rewriter
+	if cfg.Rewriter != "" {
+		if !registry.RewriterRegistry().IsRegistered(cfg.Rewriter) {
+			serviceLogger.Warnf("rewriter %q not found in registry", cfg.Rewriter)
+		}
+		rew = registry.RewriterRegistry().Get(cfg.Rewriter)
 	}
 
 	routerOpts = []chain.RouterOption{
@@ -356,6 +391,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 			handler.TrafficLimiterOption(registry.TrafficLimiterRegistry().Get(cfg.Handler.Limiter)),
 			handler.ObserverOption(registry.ObserverRegistry().Get(cfg.Handler.Observer)),
 			handler.RecordersOption(recorders...),
+			handler.RewriterOption(rew),
 			handler.LoggerOption(handlerLogger),
 			handler.ServiceOption(cfg.Name),
 			handler.NetnsOption(netnsIn),

@@ -29,6 +29,30 @@ import (
 // metadata-driven options (so_mark, interface, netns, proxy protocol), sets up
 // bypass rules, node filters, HTTP settings, and TLS node settings. The hop
 // parameter is used only for logging context.
+
+func parseBodyRewrites(vs []config.HTTPBodyRewriteConfig, log logger.Logger) []chain.HTTPBodyRewriteSettings {
+	var out []chain.HTTPBodyRewriteSettings
+	for _, v := range vs {
+		pattern, _ := regexp.Compile(v.Match)
+		rw := chain.HTTPBodyRewriteSettings{
+			Type:        v.Type,
+			Pattern:     pattern,
+			Replacement: []byte(v.Replacement),
+			MaxChunkSize: v.MaxChunkSize,
+		}
+		if v.Rewriter != "" {
+			if !registry.RewriterRegistry().IsRegistered(v.Rewriter) {
+				log.Warnf("rewriter %q not found in registry for rewrite rule", v.Rewriter)
+			}
+			rw.Rewriter = registry.RewriterRegistry().Get(v.Rewriter)
+		}
+		if pattern != nil || rw.Rewriter != nil {
+			out = append(out, rw)
+		}
+	}
+	return out
+}
+
 func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.Node, error) {
 	if cfg == nil {
 		return nil, nil
@@ -176,6 +200,10 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		if rule := strings.TrimSpace(cfg.Matcher.Rule); rule != "" {
 			if matcher, err := routing.NewMatcher(rule); err == nil {
 				log.Debugf("new matcher for node %s with rule %s", cfg.Name, cfg.Matcher.Rule)
+				// Priority 0 means "use default": automatically set to the
+				// rule length so longer (more specific) rules outrank shorter
+				// ones. Use a negative priority to opt out of this behavior
+				// and always go through the selector.
 				if priority == 0 {
 					priority = len(cfg.Matcher.Rule)
 				}
@@ -222,33 +250,9 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 				})
 			}
 		}
-		for _, v := range cfg.HTTP.RewriteBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
-		for _, v := range cfg.HTTP.RewriteResponseBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteResponseBody = append(settings.RewriteResponseBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
-		for _, v := range cfg.HTTP.RewriteRequestBody {
-			if pattern, _ := regexp.Compile(v.Match); pattern != nil {
-				settings.RewriteRequestBody = append(settings.RewriteRequestBody, chain.HTTPBodyRewriteSettings{
-					Type:        v.Type,
-					Pattern:     pattern,
-					Replacement: []byte(v.Replacement),
-				})
-			}
-		}
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteBody, log)...)
+		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteResponseBody, log)...)
+		settings.RewriteRequestBody = append(settings.RewriteRequestBody, parseBodyRewrites(cfg.HTTP.RewriteRequestBody, log)...)
 		opts = append(opts, chain.HTTPNodeOption(settings))
 	}
 
