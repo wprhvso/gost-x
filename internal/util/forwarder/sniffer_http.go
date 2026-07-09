@@ -2,6 +2,7 @@ package forwarder
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -27,6 +28,19 @@ import (
 	stats_wrapper "github.com/go-gost/x/observer/stats/wrapper"
 	xrecorder "github.com/go-gost/x/recorder"
 )
+
+// borrowBodyPrefix reads up to n bytes from body for inspection without
+// consuming the stream: the prefix is re-prepended via MultiReader so the
+// full body still flows downstream. It returns the prefix (shorter than n on
+// EOF or underlying read error) and the restored ReadCloser to assign back to
+// the caller's body field. The read error is intentionally ignored —
+// io.LimitReader yields whatever was read, which is all a matcher or recorder
+// needs; centralizing it here keeps the swallow in one audited place.
+func borrowBodyPrefix(body io.ReadCloser, n int) (prefix []byte, restored io.ReadCloser) {
+	prefix, _ = io.ReadAll(io.LimitReader(body, int64(n)))
+	restored = io.NopCloser(io.MultiReader(bytes.NewReader(prefix), body))
+	return
+}
 
 // HandleHTTP sniffs and proxies an HTTP connection. It reads the initial
 // request, performs node selection via the configured hop, and forwards the
@@ -180,6 +194,35 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 		if clientAddr, _ := net.ResolveTCPAddr("tcp", ho.recorderObject.ClientAddr); clientAddr != nil {
 			clientIP = clientAddr.IP
 		}
+
+		// If any node in the hop opts in to body matching, read a sized prefix
+		// of the request body now and restore it so the matcher can inspect it
+		// without consuming the stream that is still forwarded below.
+		var bodyPrefix []byte
+		var maxBodySize int
+		if nl, ok := ho.hop.(hop.NodeList); ok {
+			for _, n := range nl.Nodes() {
+				if n == nil {
+					continue
+				}
+				if s := n.Options().MatcherBodySize; s > maxBodySize {
+					maxBodySize = s
+				}
+			}
+		}
+		if maxBodySize > 0 && req.Body != nil {
+			bodyPrefix, req.Body = borrowBodyPrefix(req.Body, maxBodySize)
+			// The forwarded body keeps its original encoding; only the prefix shown
+			// to body matchers is decoded so BodyRegexp sees plaintext. Best-effort:
+			// a truncated compressed stream yields whatever decoded so far, which is
+			// where match patterns (e.g. leading JSON fields) live anyway.
+			if enc := req.Header.Get("Content-Encoding"); enc != "" && enc != "identity" && len(bodyPrefix) > 0 {
+				if decoded, _ := decompressBody(bodyPrefix, enc); len(decoded) > 0 {
+					bodyPrefix = decoded
+				}
+			}
+		}
+
 		node = ho.hop.Select(ctx,
 			hop.ClientIPSelectOption(clientIP),
 			hop.ProtocolSelectOption(sniffing.ProtoHTTP),
@@ -188,6 +231,7 @@ func resolveHTTPNode(ctx context.Context, host string, req *http.Request, ho *Ha
 			hop.PathSelectOption(req.URL.Path),
 			hop.QuerySelectOption(req.URL.Query()),
 			hop.HeaderSelectOption(req.Header),
+			hop.BodySelectOption(bodyPrefix),
 		)
 	}
 	if node == nil {
@@ -309,6 +353,19 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		},
 	}
 
+	// Capture pre-rewrite originals only when this node actually configures a
+	// rewrite, so the recorder sees both client-sent and forwarded values.
+	// Keep these predicates in sync with chain.HTTPNodeSettings' fields: a new
+	// rewrite dimension added there must be added here too, or its originals
+	// won't be captured.
+	httpSettings := node.Options().HTTP
+	hasReqRewrite := httpSettings != nil && (httpSettings.Host != "" ||
+		len(httpSettings.RequestHeader) > 0 || len(httpSettings.RewriteURL) > 0 ||
+		len(httpSettings.RewriteRequestBody) > 0)
+	hasRespRewrite := httpSettings != nil && (len(httpSettings.ResponseHeader) > 0 ||
+		len(httpSettings.RewriteResponseBody) > 0)
+	bodySize := clampBodySize(h.RecorderOptions)
+
 	res := &http.Response{
 		ProtoMajor: req.ProtoMajor,
 		ProtoMinor: req.ProtoMinor,
@@ -328,7 +385,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	var responseHeader map[string]string
 	var respBodyRewrites []chain.HTTPBodyRewriteSettings
 	var reqBodyRewrites []chain.HTTPBodyRewriteSettings
-	if httpSettings := node.Options().HTTP; httpSettings != nil {
+	if httpSettings != nil {
 		if auther := httpSettings.Auther; auther != nil {
 			username, password, _ := req.BasicAuth()
 			id, ok := auther.Authenticate(ctx, username, password, auth.WithService(ho.service))
@@ -344,18 +401,39 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 			ctx = xctx.ContextWithClientID(ctx, xctx.ClientID(id))
 		}
 
+		if hasReqRewrite {
+			ro.HTTP.OriginalHost = ro.HTTP.Host
+			ro.HTTP.OriginalURI = ro.HTTP.URI
+			ro.HTTP.OriginalRequest = &xrecorder.HTTPRequestRecorderObject{
+				ContentLength: ro.HTTP.Request.ContentLength,
+				Header:        ro.HTTP.Request.Header.Clone(),
+			}
+		}
+
 		if httpSettings.Host != "" {
 			req.Host = httpSettings.Host
 		}
 		for k, v := range httpSettings.RequestHeader {
-			req.Header.Set(k, v)
+			if v == "" {
+				req.Header.Del(k)
+			} else {
+				req.Header.Set(k, v)
+			}
 			ro.HTTP.Request.Header = req.Header.Clone()
 		}
 
 		for _, re := range httpSettings.RewriteURL {
 			if re.Pattern.MatchString(req.URL.Path) {
 				if s := re.Pattern.ReplaceAllString(req.URL.Path, re.Replacement); s != "" {
-					req.URL.Path = s
+					// Split replacement at '?' so the query portion
+					// goes into RawQuery rather than being percent-encoded
+					// as part of Path (%3F for '?').
+					if path, query, hasQuery := strings.Cut(s, "?"); hasQuery {
+						req.URL.Path = path
+						req.URL.RawQuery = query
+					} else {
+						req.URL.Path = s
+					}
 					ro.HTTP.URI = req.URL.RequestURI()
 					break
 				}
@@ -367,6 +445,15 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		reqBodyRewrites = httpSettings.RewriteRequestBody
 	}
 
+	// Snapshot the original request body before rewriting, restoring it via
+	// MultiReader so the body is read from the wire only once. Only when body
+	// recording is enabled and request bodies are actually rewritten.
+	if hasReqRewrite && bodySize > 0 && len(reqBodyRewrites) > 0 && req.Body != nil {
+		origReqBody, restored := borrowBodyPrefix(req.Body, bodySize)
+		req.Body = restored
+		ro.HTTP.OriginalRequest.Body = origReqBody
+	}
+
 	// Rewrite request body before wrapping for recording,
 	// so the recorder sees the rewritten content.
 	if err = rewriteReqBody(ctx, req, reqBodyRewrites...); err != nil {
@@ -374,7 +461,7 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		return
 	}
 
-	if bodySize := clampBodySize(h.RecorderOptions); bodySize > 0 && req.Body != nil {
+	if bodySize > 0 && req.Body != nil {
 		reqBody := xhttp.NewBody(req.Body, bodySize)
 		req.Body = reqBody
 		err = req.Write(cc)
@@ -410,18 +497,19 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 	defer resp.Body.Close()
 	xio.SetReadDeadline(cc, time.Time{})
 
-	if len(responseHeader) > 0 {
-		if resp.Header == nil {
-			resp.Header = http.Header{}
-		}
-		for k, v := range responseHeader {
-			resp.Header.Set(k, v)
+	if hasRespRewrite {
+		ro.HTTP.OriginalResponse = &xrecorder.HTTPResponseRecorderObject{
+			ContentLength: resp.ContentLength,
+			Header:        resp.Header.Clone(),
 		}
 	}
 
+	// Reminder: apply responseHeader AFTER body rewrite, not before —
+	// if responseHeader overrides Content-Type, the rewrite must first
+	// read the original upstream Content-Type to decide
+	// streaming vs non-streaming.
+
 	ro.HTTP.StatusCode = resp.StatusCode
-	ro.HTTP.Response.Header = resp.Header.Clone()
-	ro.HTTP.Response.ContentLength = resp.ContentLength
 
 	if log.IsLevelEnabled(logger.TraceLevel) {
 		dump, _ := httputil.DumpResponse(resp, false)
@@ -446,12 +534,33 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 		resp.Header.Set("Connection", "close")
 	}
 
+	// Snapshot the original response body before rewriting, restoring it via
+	// MultiReader so the body is read from upstream only once.
+	if hasRespRewrite && bodySize > 0 && len(respBodyRewrites) > 0 {
+		origRespBody, restored := borrowBodyPrefix(resp.Body, bodySize)
+		resp.Body = restored
+		ro.HTTP.OriginalResponse.Body = origRespBody
+	}
+
 	if err = rewriteRespBody(ctx, resp, respBodyRewrites...); err != nil {
 		log.Errorf("rewrite body: %v", err)
 		return
 	}
 
-	if bodySize := clampBodySize(h.RecorderOptions); bodySize > 0 {
+	// Apply response header overrides after body rewrite so Content-Type
+	// doesn't affect rewriteRespBody's streaming/non-streaming decision.
+	if len(responseHeader) > 0 {
+		if resp.Header == nil {
+			resp.Header = http.Header{}
+		}
+		for k, v := range responseHeader {
+			resp.Header.Set(k, v)
+		}
+	}
+	ro.HTTP.Response.Header = resp.Header.Clone()
+	ro.HTTP.Response.ContentLength = resp.ContentLength
+
+	if bodySize > 0 {
 		respBody := xhttp.NewBody(resp.Body, bodySize)
 		resp.Body = respBody
 		err = resp.Write(rw)
@@ -472,4 +581,3 @@ func (h *Sniffer) httpRoundTrip(ctx context.Context, rw, cc io.ReadWriteCloser, 
 
 	return
 }
-

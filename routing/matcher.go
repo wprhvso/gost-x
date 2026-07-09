@@ -156,6 +156,7 @@ var httpFuncs = map[string]func(*matchersTree, ...string) error{
 	"HeaderRegexp": expectNParameters(headerRegexp, 1, 2),
 	"Query":        expectNParameters(query, 1, 2),
 	"QueryRegexp":  expectNParameters(queryRegexp, 1, 2),
+	"BodyRegexp":   expectNParameters(bodyRegexp, 1),
 	"Bypass":       expectNParameters(bypass, 1),
 	"Admission":    expectNParameters(admission, 1),
 }
@@ -451,6 +452,22 @@ func queryRegexp(tree *matchersTree, queries ...string) error {
 		})
 
 		return idx >= 0
+	}
+
+	return nil
+}
+
+func bodyRegexp(tree *matchersTree, patterns ...string) error {
+	re, err := regexp.Compile(patterns[0])
+	if err != nil {
+		return fmt.Errorf("compiling BodyRegexp matcher: %w", err)
+	}
+
+	tree.matcher = func(req *routing.Request) bool {
+		if len(req.Body) == 0 {
+			return false
+		}
+		return re.Match(req.Body)
 	}
 
 	return nil
