@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"net"
 	"time"
-	"unsafe"
 
 	"github.com/go-gost/core/dialer"
 	"github.com/go-gost/core/logger"
@@ -82,7 +81,7 @@ func (d *utlsDialer) Handshake(ctx context.Context, conn net.Conn, options ...di
 	clientHelloID, ok := GetClientHelloID(d.md.fingerprint)
 	if ok {
 		d.log.Debugf("utls handshake with fingerprint: %s", d.md.fingerprint)
-		utlsCfg := (*utls.Config)(unsafe.Pointer(d.options.TLSConfig))
+		utlsCfg := toUTLSConfig(d.options.TLSConfig)
 		uconn := utls.UClient(conn, utlsCfg, clientHelloID)
 		if err := uconn.HandshakeContext(ctx); err != nil {
 			conn.Close()
@@ -103,4 +102,110 @@ func (d *utlsDialer) Handshake(ctx context.Context, conn net.Conn, options ...di
 	}
 
 	return tlsConn, nil
+}
+
+// toUTLSConfig builds an equivalent utls.Config from a standard crypto/tls.Config.
+//
+// utls.Config is a distinct type from crypto/tls.Config and its field offsets
+// diverge from ServerName onward (crypto/tls added fields utls does not have),
+// so a direct (*utls.Config)(unsafe.Pointer(...)) reinterprets memory and reads
+// garbage for ServerName/InsecureSkipVerify — which is what broke TLS
+// verification for this dialer. We copy fields explicitly instead.
+//
+// Fields whose types differ between the two packages (Certificate, ClientAuth,
+// CurveID, RenegotiationSupport, ConnectionState, the Get* callbacks,
+// ClientSessionCache) are converted or skipped: the config path that feeds this
+// dialer (LoadClientConfig) never populates the Get*/ClientSessionCache
+// callbacks, so skipping them is safe here.
+func toUTLSConfig(c *tls.Config) *utls.Config {
+	if c == nil {
+		return &utls.Config{}
+	}
+
+	uc := &utls.Config{
+		Rand:                        c.Rand,
+		Time:                        c.Time,
+		Certificates:                toUTLSCertificates(c.Certificates),
+		RootCAs:                     c.RootCAs,
+		NextProtos:                  c.NextProtos,
+		ServerName:                  c.ServerName,
+		ClientAuth:                  utls.ClientAuthType(c.ClientAuth),
+		ClientCAs:                   c.ClientCAs,
+		InsecureSkipVerify:          c.InsecureSkipVerify,
+		CipherSuites:                c.CipherSuites,
+		PreferServerCipherSuites:    c.PreferServerCipherSuites,
+		SessionTicketsDisabled:      c.SessionTicketsDisabled,
+		CurvePreferences:            toUTLSCurveIDs(c.CurvePreferences),
+		DynamicRecordSizingDisabled: c.DynamicRecordSizingDisabled,
+		Renegotiation:               utls.RenegotiationSupport(c.Renegotiation),
+		KeyLogWriter:                c.KeyLogWriter,
+		MinVersion:                  c.MinVersion,
+		MaxVersion:                  c.MaxVersion,
+		VerifyPeerCertificate:       c.VerifyPeerCertificate,
+	}
+
+	if c.VerifyConnection != nil {
+		vc := c.VerifyConnection
+		uc.VerifyConnection = func(cs utls.ConnectionState) error {
+			return vc(tls.ConnectionState{
+				PeerCertificates: cs.PeerCertificates,
+			})
+		}
+	}
+
+	return uc
+}
+
+func toUTLSCertificates(certs []tls.Certificate) []utls.Certificate {
+	if certs == nil {
+		return nil
+	}
+	out := make([]utls.Certificate, len(certs))
+	for i, c := range certs {
+		sa := make([]utls.SignatureScheme, len(c.SupportedSignatureAlgorithms))
+		for j, s := range c.SupportedSignatureAlgorithms {
+			sa[j] = utls.SignatureScheme(s)
+		}
+		out[i] = utls.Certificate{
+			Certificate:                  c.Certificate,
+			PrivateKey:                   c.PrivateKey,
+			SupportedSignatureAlgorithms: sa,
+			OCSPStaple:                   c.OCSPStaple,
+			SignedCertificateTimestamps:  c.SignedCertificateTimestamps,
+			Leaf:                         c.Leaf,
+		}
+	}
+	return out
+}
+
+// utlsCurves maps the crypto/tls curve IDs that utls understands.
+//
+// crypto/tls and utls use separate CurveID enumerations. Go has added
+// post-quantum hybrid curves (X25519MLKEM768, SecP256r1MLKEM768,
+// SecP384r1MLKEM1024) whose numeric IDs utls does not recognise, so a
+// blind utls.CurveID(id) cast turns them into unsupported curve IDs and
+// aborts the handshake with "CurvePreferences includes unsupported curve".
+// We keep only the curves utls can actually use and drop the rest; if none
+// survive, return nil so utls falls back to the fingerprint's defaults.
+var utlsCurves = map[tls.CurveID]utls.CurveID{
+	tls.X25519:   utls.X25519,
+	tls.CurveP256: utls.CurveP256,
+	tls.CurveP384: utls.CurveP384,
+	tls.CurveP521: utls.CurveP521,
+}
+
+func toUTLSCurveIDs(ids []tls.CurveID) []utls.CurveID {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]utls.CurveID, 0, len(ids))
+	for _, id := range ids {
+		if c, ok := utlsCurves[id]; ok {
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

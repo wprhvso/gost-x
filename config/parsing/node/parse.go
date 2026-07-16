@@ -5,6 +5,7 @@ import (
 	"net"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/go-gost/core/chain"
 	"github.com/go-gost/core/connector"
@@ -281,5 +282,49 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		}
 		opts = append(opts, chain.TLSNodeOption(tlsCfg))
 	}
-	return chain.NewNode(cfg.Name, cfg.Addr, opts...), nil
+
+	node := chain.NewNode(cfg.Name, cfg.Addr, opts...)
+	if cfg.Probe != nil {
+		if pc := parseProbeConfig(cfg.Probe); pc != nil {
+			xchain.StartNodeProbe(node, pc, nodeLogger)
+		}
+	}
+	return node, nil
+}
+
+// parseProbeConfig converts a config.ProbeConfig into a chain.ProbeConfig.
+// Returns nil when the config is invalid (e.g. empty addr).
+func parseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
+	if cfg == nil || (cfg.Addr == "" && cfg.Type != "cmd") {
+		return nil
+	}
+	if cfg.Type == "cmd" && cfg.Command == "" {
+		return nil
+	}
+	pt := chain.ProbeTypeTCP
+	switch cfg.Type {
+	case "http":
+		pt = chain.ProbeTypeHTTP
+	case "cmd":
+		pt = chain.ProbeTypeCmd
+	}
+	interval := cfg.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return &chain.ProbeConfig{
+		Type:           pt,
+		Addr:           cfg.Addr,
+		Interval:       interval,
+		Timeout:        timeout,
+		HTTPPath:       cfg.HTTPPath,
+		HTTPHost:       cfg.HTTPHost,
+		HTTPHeaders:    cfg.HTTPHeaders,
+		ExpectedStatus: cfg.ExpectedStatus,
+		Command:        cfg.Command,
+	}
 }
