@@ -26,6 +26,8 @@ import (
 	"github.com/go-gost/core/service"
 	xctx "github.com/go-gost/x/ctx"
 	xlogger "github.com/go-gost/x/logger"
+	xbypass "github.com/go-gost/x/bypass"
+	rate_limiter "github.com/go-gost/x/limiter/rate"
 	xmetrics "github.com/go-gost/x/metrics"
 	xstats "github.com/go-gost/x/observer/stats"
 	"github.com/google/shlex"
@@ -44,6 +46,7 @@ type options struct {
 	observerPeriod time.Duration
 	logger         logger.Logger
 	labels         map[string]string
+	closers        []io.Closer
 }
 
 // Option is a functional option for configuring a service.
@@ -119,6 +122,13 @@ func ObserverPeriodOption(period time.Duration) Option {
 func LabelsOption(labels map[string]string) Option {
 	return func(opts *options) {
 		opts.labels = labels
+	}
+}
+
+// ClosersOption registers io.Closers that are called on service shutdown.
+func ClosersOption(closers ...io.Closer) Option {
+	return func(opts *options) {
+		opts.closers = append(opts.closers, closers...)
 	}
 }
 
@@ -327,13 +337,17 @@ func (s *defaultService) Serve() error {
 			}
 
 			if err := s.handler.Handle(ctx, conn); err != nil {
-				log.Error(err)
-				if v := xmetrics.GetCounter(xmetrics.MetricServiceHandlerErrorsCounter,
-					metrics.Labels{"service": s.name, "client": clientIP}); v != nil {
-					v.Inc()
-				}
-				if sts := s.status.stats; sts != nil {
-					sts.Add(stats.KindTotalErrs, 1)
+				if isServerError(err) {
+					log.Error(err)
+					if v := xmetrics.GetCounter(xmetrics.MetricServiceHandlerErrorsCounter,
+						metrics.Labels{"service": s.name, "client": clientIP}); v != nil {
+						v.Inc()
+					}
+					if sts := s.status.stats; sts != nil {
+						sts.Add(stats.KindTotalErrs, 1)
+					}
+				} else {
+					log.Debug(err)
 				}
 			}
 		}()
@@ -362,6 +376,11 @@ func (s *defaultService) Close() error {
 			if err := closer.Close(); err != nil {
 				errs = append(errs, err)
 			}
+		}
+	}
+	for _, c := range s.options.closers {
+		if err := c.Close(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	if err := s.listener.Close(); err != nil {
@@ -469,6 +488,22 @@ func (s *defaultService) observeStats(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// isServerError reports whether err represents a server-side or infrastructure
+// failure that should be counted as a handler error. Client-side disconnects
+// (io.EOF, net.ErrClosed, context cancellation) and policy decisions (rate
+// limiting, bypass routing) are not server errors.
+func isServerError(err error) bool {
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, xbypass.ErrBypass) ||
+		errors.Is(err, rate_limiter.ErrRateLimit) {
+		return false
+	}
+	return true
 }
 
 // ServiceEvent is an observer event representing a service state change.

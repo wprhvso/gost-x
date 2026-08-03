@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"io"
 	"runtime"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-gost/core/hop"
 	"github.com/go-gost/core/listener"
 	"github.com/go-gost/core/rewriter"
+	"github.com/go-gost/core/routing"
 	"github.com/go-gost/core/logger"
 	"github.com/go-gost/core/observer/stats"
 	"github.com/go-gost/core/recorder"
@@ -28,8 +30,12 @@ import (
 	bypass_parser "github.com/go-gost/x/config/parsing/bypass"
 	hop_parser "github.com/go-gost/x/config/parsing/hop"
 	logger_parser "github.com/go-gost/x/config/parsing/logger"
+	node_parser "github.com/go-gost/x/config/parsing/node"
 	selector_parser "github.com/go-gost/x/config/parsing/selector"
+	xhop "github.com/go-gost/x/hop"
 	tls_util "github.com/go-gost/x/internal/util/tls"
+	xrouting "github.com/go-gost/x/routing"
+	xs "github.com/go-gost/x/selector"
 	quota_wrapper "github.com/go-gost/x/limiter/quota/wrapper"
 	cache_limiter "github.com/go-gost/x/limiter/traffic/cache"
 	"github.com/go-gost/x/metadata"
@@ -199,13 +205,32 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	}
 	if !ignoreChain {
 		routerOpts = append(routerOpts,
-			chain.ChainRouterOption(chainGroup(cfg.Listener.Chain, cfg.Listener.ChainGroup)),
+			chain.ChainRouterOption(chainGroup(cfg.Listener.Chain, cfg.Listener.ChainGroup, log)),
 		)
 	}
+	lnRouter := xchain.NewRouter(routerOpts...)
+
+	// The routers may hold a chainGroup running probe goroutines, and the
+	// forwarder hop may run probe goroutines of its own; make sure they are
+	// closed if service construction fails after this point.
+	var hRouter *xchain.Router
+	var fwdCloser io.Closer
+	success := false
+	defer func() {
+		if !success {
+			lnRouter.Close()
+			if hRouter != nil {
+				hRouter.Close()
+			}
+			if fwdCloser != nil {
+				fwdCloser.Close()
+			}
+		}
+	}()
 
 	listenOpts := []listener.Option{
 		listener.AddrOption(cfg.Addr),
-		listener.RouterOption(xchain.NewRouter(routerOpts...)),
+		listener.RouterOption(lnRouter),
 		listener.AutherOption(auther),
 		listener.AuthOption(auth_parser.Info(cfg.Listener.Auth)),
 		listener.TLSConfigOption(tlsConfig),
@@ -375,14 +400,15 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	}
 	if !ignoreChain {
 		routerOpts = append(routerOpts,
-			chain.ChainRouterOption(chainGroup(cfg.Handler.Chain, cfg.Handler.ChainGroup)),
+			chain.ChainRouterOption(chainGroup(cfg.Handler.Chain, cfg.Handler.ChainGroup, log)),
 		)
 	}
 
 	var h handler.Handler
 	if rf := registry.HandlerRegistry().Get(cfg.Handler.Type); rf != nil {
+		hRouter = xchain.NewRouter(routerOpts...)
 		h = rf(
-			handler.RouterOption(xchain.NewRouter(routerOpts...)),
+			handler.RouterOption(hRouter),
 			handler.AutherOption(auther),
 			handler.AuthOption(auth_parser.Info(cfg.Handler.Auth)),
 			handler.BypassOption(xbypass.BypassGroup(bypass_parser.List(cfg.Bypass, cfg.Bypasses...)...)),
@@ -391,6 +417,7 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 			handler.TrafficLimiterOption(registry.TrafficLimiterRegistry().Get(cfg.Handler.Limiter)),
 			handler.ObserverOption(registry.ObserverRegistry().Get(cfg.Handler.Observer)),
 			handler.RecordersOption(recorders...),
+			handler.CacheOption(registry.CacheRegistry().Get(cfg.Cache)),
 			handler.RewriterOption(rew),
 			handler.LoggerOption(handlerLogger),
 			handler.ServiceOption(cfg.Name),
@@ -401,10 +428,11 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 	}
 
 	if forwarder, ok := h.(handler.Forwarder); ok {
-		hop, err := parseForwarder(cfg.Forwarder, log)
+		hop, closer, err := parseForwarder(cfg.Forwarder, log)
 		if err != nil {
 			return nil, err
 		}
+		fwdCloser = closer
 		forwarder.Forward(hop)
 	}
 
@@ -417,6 +445,10 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		return nil, err
 	}
 
+	closers := []io.Closer{lnRouter, hRouter}
+	if fwdCloser != nil {
+		closers = append(closers, fwdCloser)
+	}
 	s := xservice.NewService(cfg.Name, ln, h,
 		xservice.AdmissionOption(xadmission.AdmissionGroup(admissions...)),
 		xservice.PreUpOption(preUp),
@@ -429,15 +461,31 @@ func ParseService(cfg *config.ServiceConfig) (service.Service, error) {
 		xservice.ObserverPeriodOption(observerPeriod),
 		xservice.LoggerOption(serviceLogger),
 		xservice.LabelsOption(labels),
+		xservice.ClosersOption(closers...),
 	)
+	success = true
 
 	serviceLogger.Infof("listening on %s/%s", s.Addr().String(), s.Addr().Network())
 	return s, nil
 }
 
-func parseForwarder(cfg *config.ForwarderConfig, log logger.Logger) (hop.Hop, error) {
+// parseForwarder builds the forwarder hop for a service. The returned
+// io.Closer is non-nil only when the hop is owned by the service (inline
+// nodes or a hop group) and must be closed on service shutdown; hops from
+// the HopRegistry are closed by the registry on unregister.
+func parseForwarder(cfg *config.ForwarderConfig, log logger.Logger) (hop.Hop, io.Closer, error) {
 	if cfg == nil {
-		return nil, nil
+		return nil, nil, nil
+	}
+
+	// HopGroup takes precedence over Hop / Name / Nodes.
+	if cfg.HopGroup != nil {
+		group, err := parseHopGroup(cfg.HopGroup, log)
+		if err != nil || group == nil {
+			return nil, nil, err
+		}
+		closer, _ := group.(io.Closer)
+		return group, closer, nil
 	}
 
 	hopName := cfg.Hop
@@ -445,7 +493,7 @@ func parseForwarder(cfg *config.ForwarderConfig, log logger.Logger) (hop.Hop, er
 		hopName = cfg.Name
 	}
 	if hopName != "" {
-		return registry.HopRegistry().Get(hopName), nil
+		return registry.HopRegistry().Get(hopName), nil, nil
 	}
 
 	hc := config.HopConfig{
@@ -491,32 +539,128 @@ func parseForwarder(cfg *config.ForwarderConfig, log logger.Logger) (hop.Hop, er
 			Metadata: node.Metadata,
 		})
 	}
-	return hop_parser.ParseHop(&hc, log)
+	// Inline nodes build a per-service hop, owned (and closed) by the service.
+	h, err := hop_parser.ParseHop(&hc, log)
+	if err != nil || h == nil {
+		return nil, nil, err
+	}
+	closer, _ := h.(io.Closer)
+	return h, closer, nil
 }
 
-func chainGroup(name string, group *config.ChainGroupConfig) chain.Chainer {
-	var chains []chain.Chainer
-	var sel selector.Selector[chain.Chainer]
-
-	if c := registry.ChainRegistry().Get(name); c != nil {
-		chains = append(chains, c)
+func parseHopGroup(cfg *config.ForwardHopGroupConfig, log logger.Logger) (hop.Hop, error) {
+	if cfg == nil {
+		return nil, nil
 	}
-	if group != nil {
-		for _, s := range group.Chains {
-			if c := registry.ChainRegistry().Get(s); c != nil {
-				chains = append(chains, c)
+
+	var entries []*xhop.HopEntry
+	for _, hc := range cfg.Hops {
+		if hc == nil {
+			continue
+		}
+		h := registry.HopRegistry().Get(hc.Hop)
+		if h == nil {
+			log.Warnf("hop %q not found in hopGroup, skipping", hc.Hop)
+			continue
+		}
+
+		var m routing.Matcher
+		if hc.Matcher != nil && hc.Matcher.Rule != "" {
+			var err error
+			m, err = xrouting.NewMatcher(hc.Matcher.Rule)
+			if err != nil {
+				log.Warnf("hop %q: bad matcher rule %q: %v, skipping", hc.Hop, hc.Matcher.Rule, err)
+				continue
 			}
 		}
-		sel = selector_parser.ParseChainSelector(group.Selector)
+
+		entries = append(entries, xhop.NewHopEntry(h, m, node_parser.ParseProbeConfig(hc.Probe)))
 	}
-	if len(chains) == 0 {
+
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	var hopSelector selector.Selector[hop.Hop]
+	if cfg.Selector != nil {
+		var strategy selector.Strategy[hop.Hop]
+		switch cfg.Selector.Strategy {
+		case "round", "rr":
+			strategy = xs.RoundRobinStrategy[hop.Hop]()
+		case "random", "rand":
+			strategy = xs.RandomStrategy[hop.Hop]()
+		case "fifo", "ha":
+			strategy = xs.FIFOStrategy[hop.Hop]()
+		case "hash":
+			strategy = xs.HashStrategy[hop.Hop]()
+		default:
+			strategy = xs.RoundRobinStrategy[hop.Hop]()
+		}
+		hopSelector = xs.NewSelector(
+			strategy,
+			xs.FailFilter[hop.Hop](cfg.Selector.MaxFails, cfg.Selector.FailTimeout),
+			xs.BackupFilter[hop.Hop](),
+		)
+	}
+	if hopSelector == nil {
+		hopSelector = xs.NewSelector(
+			xs.RoundRobinStrategy[hop.Hop](),
+			xs.FailFilter[hop.Hop](xs.DefaultMaxFails, xs.DefaultFailTimeout),
+			xs.BackupFilter[hop.Hop](),
+		)
+	}
+
+	return xhop.NewHopGroup(
+		xhop.WithEntriesOption(entries...),
+		xhop.WithGroupSelectorOption(hopSelector),
+		xhop.WithGroupLoggerOption(log.WithFields(map[string]any{
+			"kind":    "hopGroup",
+			"service": "forwarder",
+		})),
+	), nil
+}
+
+func chainGroup(name string, group *config.ChainGroupConfig, log logger.Logger) chain.Chainer {
+	var entries []*xchain.ChainEntry
+
+	if c := registry.ChainRegistry().Get(name); c != nil {
+		entries = append(entries, xchain.NewChainEntry(c, nil, nil))
+	}
+	if group != nil {
+		for _, ge := range group.Chains {
+			c := registry.ChainRegistry().Get(ge.Chain)
+			if c == nil {
+				log.Warnf("chain %q not found in chainGroup, skipping", ge.Chain)
+				continue
+			}
+
+			var m routing.Matcher
+			if ge.Matcher != nil && ge.Matcher.Rule != "" {
+				var err error
+				m, err = xrouting.NewMatcher(ge.Matcher.Rule)
+				if err != nil {
+					log.Warnf("chain %q: bad matcher rule %q: %v, skipping", ge.Chain, ge.Matcher.Rule, err)
+					continue
+				}
+			}
+
+			entries = append(entries, xchain.NewChainEntry(c, m, node_parser.ParseProbeConfig(ge.Probe)))
+		}
+	}
+	if len(entries) == 0 {
 		return nil
 	}
 
+	var sel selector.Selector[chain.Chainer]
+	if group != nil {
+		sel = selector_parser.ParseChainSelector(group.Selector)
+	}
 	if sel == nil {
 		sel = selector_parser.DefaultChainSelector()
 	}
 
-	return xchain.NewChainGroup(chains...).
-		WithSelector(sel)
+	return xchain.NewChainGroup().
+		WithGroupEntries(entries...).
+		WithSelector(sel).
+		WithGroupLogger(log)
 }

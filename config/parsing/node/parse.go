@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,10 +26,15 @@ import (
 	"github.com/go-gost/x/routing"
 )
 
-// MaxMatcherBodySize bounds the request body prefix (in bytes) exposed to
-// body matchers via routing.Request.Body. It protects against unbounded
-// buffering when a node opts in to body matching.
-const MaxMatcherBodySize = 1 << 20 // 1MB
+// DefaultMatcherBodySize is the default request body prefix (in bytes) exposed
+// to body matchers when a node has BodyRegexp/BodyJSON matchers but no
+// explicit bodySize.
+const DefaultMatcherBodySize = 1 << 20 // 1MB
+
+// MaxMatcherBodySize is the hard cap for matcher body prefix. Values above
+// this are silently clamped. Protects against unbounded in-memory buffering
+// when a node opts in to body matching.
+const MaxMatcherBodySize = 10 << 20 // 10MB
 
 // ParseNode converts a NodeConfig into a *chain.Node. It resolves the
 // connector and dialer from their registries, applies TLS settings, extracts
@@ -39,9 +45,31 @@ const MaxMatcherBodySize = 1 << 20 // 1MB
 func parseBodyRewrites(vs []config.HTTPBodyRewriteConfig, log logger.Logger) []chain.HTTPBodyRewriteSettings {
 	var out []chain.HTTPBodyRewriteSettings
 	for _, v := range vs {
-		pattern, _ := regexp.Compile(v.Match)
+		var pattern *regexp.Regexp
+		var rewriteType string
+
+		if js, ok := strings.CutPrefix(v.Match, "json:"); ok {
+			// json:<path> or json:<path>=<value-regex>
+			path, valRegex, _ := strings.Cut(js, "=")
+			if valRegex == "" {
+				valRegex = ".*"
+			}
+			var err error
+			pattern, err = regexp.Compile(valRegex)
+			if err != nil {
+				log.Warnf("invalid JSON value regex %q for path %q: %v", valRegex, path, err)
+				continue
+			}
+			rewriteType = "json:" + path
+		} else {
+			if v.Match != "" {
+				pattern, _ = regexp.Compile(v.Match)
+			}
+			rewriteType = v.Type
+		}
+
 		rw := chain.HTTPBodyRewriteSettings{
-			Type:         v.Type,
+			Type:         rewriteType,
 			Pattern:      pattern,
 			Replacement:  []byte(v.Replacement),
 			MaxChunkSize: v.MaxChunkSize,
@@ -220,12 +248,13 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 			}
 		}
 
-		if bodySize := cfg.Matcher.BodySize; bodySize > 0 {
-			if bodySize > MaxMatcherBodySize {
-				bodySize = MaxMatcherBodySize
-			}
-			opts = append(opts, chain.MatcherBodySizeNodeOption(bodySize))
+		bodySize := cfg.Matcher.BodySize
+		if bodySize <= 0 {
+			bodySize = DefaultMatcherBodySize
+		} else if bodySize > MaxMatcherBodySize {
+			bodySize = MaxMatcherBodySize
 		}
+		opts = append(opts, chain.MatcherBodySizeNodeOption(bodySize))
 
 		opts = append(opts, chain.PriorityNodeOption(priority))
 	}
@@ -266,6 +295,11 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteBody, log)...)
 		settings.RewriteResponseBody = append(settings.RewriteResponseBody, parseBodyRewrites(cfg.HTTP.RewriteResponseBody, log)...)
 		settings.RewriteRequestBody = append(settings.RewriteRequestBody, parseBodyRewrites(cfg.HTTP.RewriteRequestBody, log)...)
+
+		if v := strings.TrimSpace(cfg.HTTP.FailCodes); v != "" {
+			settings.FailCodes = parseFailCodes(v, nodeLogger)
+		}
+
 		opts = append(opts, chain.HTTPNodeOption(settings))
 	}
 
@@ -285,16 +319,16 @@ func ParseNode(hop string, cfg *config.NodeConfig, log logger.Logger) (*chain.No
 
 	node := chain.NewNode(cfg.Name, cfg.Addr, opts...)
 	if cfg.Probe != nil {
-		if pc := parseProbeConfig(cfg.Probe); pc != nil {
+		if pc := ParseProbeConfig(cfg.Probe); pc != nil {
 			xchain.StartNodeProbe(node, pc, nodeLogger)
 		}
 	}
 	return node, nil
 }
 
-// parseProbeConfig converts a config.ProbeConfig into a chain.ProbeConfig.
+// ParseProbeConfig converts a config.ProbeConfig into a chain.ProbeConfig.
 // Returns nil when the config is invalid (e.g. empty addr).
-func parseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
+func ParseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
 	if cfg == nil || (cfg.Addr == "" && cfg.Type != "cmd") {
 		return nil
 	}
@@ -327,4 +361,25 @@ func parseProbeConfig(cfg *config.ProbeConfig) *chain.ProbeConfig {
 		ExpectedStatus: cfg.ExpectedStatus,
 		Command:        cfg.Command,
 	}
+}
+
+// parseFailCodes parses a comma-separated status code list, e.g. "429,5xx".
+// Tokens ending in "xx" become hundred-level wildcards (5xx → 5, matching
+// 500-599). Invalid tokens are logged and skipped.
+func parseFailCodes(s string, log logger.Logger) chain.FailCodes {
+	var codes chain.FailCodes
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if len(part) == 3 && strings.HasSuffix(part, "xx") {
+			if prefix, err := strconv.Atoi(part[:1]); err == nil && prefix > 0 {
+				codes = append(codes, prefix) // < 100 → wildcard
+				continue
+			}
+		} else if code, err := strconv.Atoi(part); err == nil && code >= 100 {
+			codes = append(codes, code)
+			continue
+		}
+		log.Warnf("failCodes: invalid token %q", part)
+	}
+	return codes
 }

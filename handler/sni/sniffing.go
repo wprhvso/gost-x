@@ -14,6 +14,7 @@ import (
 	"github.com/go-gost/core/recorder"
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	xrecorder "github.com/go-gost/x/recorder"
@@ -36,6 +37,8 @@ type SnifferBuilder struct {
 	// and TLS ServerHello during sniffing. Passed through to [sniffing.Sniffer].
 	// See sniffing.Sniffer.ReadTimeout for details.
 	ReadTimeout time.Duration
+	// Cache is the HTTP response cache (nil when caching is disabled).
+	Cache *httpcache.Cache
 }
 
 // Build creates a new [sniffing.Sniffer] from the builder's configuration.
@@ -52,6 +55,7 @@ func (b *SnifferBuilder) Build() *sniffing.Sniffer {
 		CertPool:            b.CertPool,
 		MitmBypass:          b.MitmBypass,
 		ReadTimeout:         b.ReadTimeout,
+		Cache:               b.Cache,
 	}
 }
 
@@ -94,7 +98,7 @@ func (h *sniHandler) sniffingDialTLS(ctx context.Context, network, address strin
 // connection directly (which for the SNI handler means silently dropping it).
 func (h *sniHandler) handleSniffedProtocol(ctx context.Context, conn net.Conn, ro *xrecorder.HandlerRecorderObject, log logger.Logger, proto string) (handled bool, err error) {
 	switch proto {
-	case sniffing.ProtoHTTP, sniffing.ProtoTLS:
+	case sniffing.ProtoHTTP, sniffing.ProtoTLS, sniffing.ProtoRedis:
 		dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 			return h.sniffingDial(ctx, network, address, ro)
 		}
@@ -112,11 +116,19 @@ func (h *sniHandler) handleSniffedProtocol(ctx context.Context, conn net.Conn, r
 				sniffing.WithLog(log),
 			)
 		}
-		return true, sniffer.HandleTLS(ctx, "tcp", conn,
+		if proto == sniffing.ProtoTLS {
+			return true, sniffer.HandleTLS(ctx, "tcp", conn,
+				sniffing.WithService(h.options.Service),
+				sniffing.WithDial(dial),
+				sniffing.WithDialTLS(dialTLS),
+				sniffing.WithBypass(h.options.Bypass),
+				sniffing.WithRecorderObject(ro),
+				sniffing.WithLog(log),
+			)
+		}
+		return true, sniffer.HandleRedis(ctx, "tcp", conn,
 			sniffing.WithService(h.options.Service),
 			sniffing.WithDial(dial),
-			sniffing.WithDialTLS(dialTLS),
-			sniffing.WithBypass(h.options.Bypass),
 			sniffing.WithRecorderObject(ro),
 			sniffing.WithLog(log),
 		)

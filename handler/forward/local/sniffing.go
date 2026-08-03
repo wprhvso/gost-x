@@ -15,6 +15,7 @@ import (
 	ictx "github.com/go-gost/x/internal/ctx"
 	"github.com/go-gost/x/internal/net/proxyproto"
 	"github.com/go-gost/x/internal/util/forwarder"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	xrecorder "github.com/go-gost/x/recorder"
@@ -36,6 +37,8 @@ type SnifferBuilder struct {
 	// and TLS ServerHello during sniffing. Passed through to forwarder.Sniffer.
 	// See forwarder.Sniffer.ReadTimeout for details.
 	ReadTimeout         time.Duration
+	// Cache is the HTTP response cache (nil when caching is disabled).
+	Cache *httpcache.Cache
 }
 
 // Build creates a new forwarder.Sniffer from the builder's configuration.
@@ -51,6 +54,7 @@ func (b *SnifferBuilder) Build() *forwarder.Sniffer {
 		CertPool:            b.CertPool,
 		MitmBypass:          b.MitmBypass,
 		ReadTimeout:         b.ReadTimeout,
+		Cache:               b.Cache,
 	}
 }
 
@@ -72,7 +76,7 @@ func (h *forwardHandler) sniffingDial(ctx context.Context, network, address stri
 // handled and (false, nil) when the caller should fall through to raw forwarding.
 func (h *forwardHandler) handleSniffedProtocol(ctx context.Context, conn net.Conn, ro *xrecorder.HandlerRecorderObject, log logger.Logger, proto string) (handled bool, err error) {
 	switch proto {
-	case sniffing.ProtoHTTP, sniffing.ProtoTLS:
+	case sniffing.ProtoHTTP, sniffing.ProtoTLS, sniffing.ProtoRedis:
 		dial := func(ctx context.Context, network, address string) (net.Conn, error) {
 			return h.sniffingDial(ctx, network, address, ro)
 		}
@@ -88,7 +92,17 @@ func (h *forwardHandler) handleSniffedProtocol(ctx context.Context, conn net.Con
 				forwarder.WithLog(log),
 			)
 		}
-		return true, sniffer.HandleTLS(ctx, conn,
+		if proto == sniffing.ProtoTLS {
+			return true, sniffer.HandleTLS(ctx, conn,
+				forwarder.WithService(h.options.Service),
+				forwarder.WithDial(dial),
+				forwarder.WithHop(h.getHop()),
+				forwarder.WithBypass(h.options.Bypass),
+				forwarder.WithRecorderObject(ro),
+				forwarder.WithLog(log),
+			)
+		}
+		return true, sniffer.HandleRedis(ctx, conn,
 			forwarder.WithService(h.options.Service),
 			forwarder.WithDial(dial),
 			forwarder.WithHop(h.getHop()),

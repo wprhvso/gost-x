@@ -233,6 +233,7 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 		conn = xnet.NewReadWriteConn(br, conn, conn)
 		switch proto {
 		case sniffing.ProtoHTTP:
+			ro.Time = time.Time{}
 			return sniffer.HandleHTTP(ctx, "tcp", conn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
@@ -242,11 +243,20 @@ func (h *relayHandler) handleConnect(ctx context.Context, conn net.Conn, network
 				sniffing.WithLog(log),
 			)
 		case sniffing.ProtoTLS:
+			ro.Time = time.Time{}
 			return sniffer.HandleTLS(ctx, "tcp", conn,
 				sniffing.WithService(h.options.Service),
 				sniffing.WithDial(dial),
 				sniffing.WithDialTLS(dialTLS),
 				sniffing.WithBypass(h.options.Bypass),
+				sniffing.WithRecorderObject(ro),
+				sniffing.WithLog(log),
+			)
+		case sniffing.ProtoRedis:
+			ro.Time = time.Time{}
+			return sniffer.HandleRedis(ctx, "tcp", conn,
+				sniffing.WithService(h.options.Service),
+				sniffing.WithDial(dial),
 				sniffing.WithRecorderObject(ro),
 				sniffing.WithLog(log),
 			)

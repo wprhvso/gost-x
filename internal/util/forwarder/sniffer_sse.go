@@ -14,6 +14,8 @@ import (
 	"github.com/go-gost/core/rewriter"
 	xctx "github.com/go-gost/x/ctx"
 	"github.com/klauspost/compress/zstd"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // scanSSEEvents is a bufio.SplitFunc that splits SSE events on \n\n (or \r\n\r\n).
@@ -44,17 +46,17 @@ func scanSSEEvents(data []byte, atEOF bool) (advance int, token []byte, err erro
 //
 // Three processing modes:
 //
-// 1. Non-streaming (plain): eagerly buffer the entire body, rewrite once,
-//    expose the final ContentLength.
+//  1. Non-streaming (plain): eagerly buffer the entire body, rewrite once,
+//     expose the final ContentLength.
 //
-// 2. Non-streaming (compressed): decompress, rewrite, recompress, expose
-//    the final ContentLength.
+//  2. Non-streaming (compressed): decompress, rewrite, recompress, expose
+//     the final ContentLength.
 //
-// 3. SSE streaming: split on \n\n via bufio.Scanner, rewrite each event
-//    independently. The first event carries sse_phase:"start", subsequent
-//    events carry sse_phase:"event", and when the scanner hits EOF an
-//    empty-body apply(nil, sse_phase:"end") is emitted so Rewriter plugins
-//    can append a trailing event (e.g. message_stop for LLM API conversion).
+//  3. SSE streaming: split on \n\n via bufio.Scanner, rewrite each event
+//     independently. The first event carries sse_phase:"start", subsequent
+//     events carry sse_phase:"event", and when the scanner hits EOF an
+//     empty-body apply(nil, sse_phase:"end") is emitted so Rewriter plugins
+//     can append a trailing event (e.g. message_stop for LLM API conversion).
 type rewriteBody struct {
 	ctx         context.Context
 	src         io.ReadCloser
@@ -67,8 +69,8 @@ type rewriteBody struct {
 	contentLength int64 // >= 0 for non-streaming bodies; -1 for streaming
 
 	// SSE stream lifecycle state.
-	eventIndex int  // incremented per SSE event for the "event" phase
-	ended      bool // true after the stream-end phase has been emitted
+	eventIndex int   // incremented per SSE event for the "event" phase
+	ended      bool  // true after the stream-end phase has been emitted
 	scannerErr error // non-nil when scanner terminated with an error
 
 	sid string // session ID, cached from context at construction time
@@ -141,10 +143,10 @@ func newRewriteBody(ctx context.Context, src io.ReadCloser, rewrites []chain.HTT
 		}
 		// Fits: rewrite and set ContentLength.
 		rb := &rewriteBody{
-			ctx:         ctx,
-			rewrites:    rewrites,
-			contentType: ct,
-			streaming:   false,
+			ctx:           ctx,
+			rewrites:      rewrites,
+			contentType:   ct,
+			streaming:     false,
 			contentLength: -1,
 		}
 		rb.sid = xctx.SidFromContext(ctx).String()
@@ -154,15 +156,7 @@ func newRewriteBody(ctx context.Context, src io.ReadCloser, rewrites []chain.HTT
 			// Compressed: decompress → rewrite → recompress.
 			var hasTypeMatch bool
 			for _, rw := range rewrites {
-				rt := rw.Type
-				if rt == "" {
-					if rw.Rewriter != nil {
-						rt = "*"
-					} else {
-						rt = "text/html"
-					}
-				}
-				if rt == "*" || strings.Contains(rt, ct) {
+				if shouldApply(rw.Type, ct, rw.Rewriter != nil) {
 					hasTypeMatch = true
 					break
 				}
@@ -218,15 +212,7 @@ func newRewriteBody(ctx context.Context, src io.ReadCloser, rewrites []chain.HTT
 		// (avoids unnecessary decompress-recompress cycle).
 		var hasTypeMatch bool
 		for _, rw := range rewrites {
-			rt := rw.Type
-			if rt == "" {
-				if rw.Rewriter != nil {
-					rt = "*"
-				} else {
-					rt = "text/html"
-				}
-			}
-			if rt == "*" || strings.Contains(rt, ct) {
+			if shouldApply(rw.Type, ct, rw.Rewriter != nil) {
 				hasTypeMatch = true
 				break
 			}
@@ -274,8 +260,8 @@ func newRewriteBody(ctx context.Context, src io.ReadCloser, rewrites []chain.HTT
 		rb.contentLength = int64(len(rewritten))
 	} else {
 		// SSE streaming: scan events split on \n\n and rewrite each one
-	// independently on Read. Lifecycle phases (first event = start,
-	// subsequent = event, EOF = end) are assigned in Read().
+		// independently on Read. Lifecycle phases (first event = start,
+		// subsequent = event, EOF = end) are assigned in Read().
 		scanner := bufio.NewScanner(src)
 		scanner.Split(scanSSEEvents)
 		scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
@@ -312,8 +298,8 @@ func (b *rewriteBody) Read(p []byte) (n int, err error) {
 				b.ended = true
 				md := map[string]any{
 					"sid":         b.sid,
-			"direction": b.direction,
-			"uri":       b.uri,
+					"direction":   b.direction,
+					"uri":         b.uri,
 					"sse_phase":   "end",
 					"event_index": b.eventIndex,
 				}
@@ -336,8 +322,8 @@ func (b *rewriteBody) Read(p []byte) (n int, err error) {
 				b.scannerErr = err
 				md := map[string]any{
 					"sid":          b.sid,
-			"direction": b.direction,
-			"uri":       b.uri,
+					"direction":    b.direction,
+					"uri":          b.uri,
 					"sse_phase":    "end",
 					"event_index":  b.eventIndex,
 					"stream_error": err.Error(),
@@ -365,11 +351,11 @@ func (b *rewriteBody) Read(p []byte) (n int, err error) {
 			phase = "start"
 		}
 		md := map[string]any{
-			"sid":          b.sid,
-			"direction": b.direction,
-			"uri":       b.uri,
-			"sse_phase":    phase,
-			"event_index":  b.eventIndex,
+			"sid":         b.sid,
+			"direction":   b.direction,
+			"uri":         b.uri,
+			"sse_phase":   phase,
+			"event_index": b.eventIndex,
 		}
 		b.eventIndex++
 
@@ -498,15 +484,7 @@ func (b *rewriteBody) apply(body []byte, opts ...rewriter.RewriteOption) ([]byte
 		return body, nil
 	}
 	for _, rw := range b.rewrites {
-		rewriteType := rw.Type
-		if rewriteType == "" {
-			if rw.Rewriter != nil {
-				rewriteType = "*"
-			} else {
-				rewriteType = "text/html"
-			}
-		}
-		if rewriteType != "*" && !strings.Contains(rewriteType, b.contentType) {
+		if !shouldApply(rw.Type, b.contentType, rw.Rewriter != nil) {
 			continue
 		}
 
@@ -519,8 +497,37 @@ func (b *rewriteBody) apply(body []byte, opts ...rewriter.RewriteOption) ([]byte
 				body = rewritten
 			}
 		} else if rw.Pattern != nil {
-			body = rw.Pattern.ReplaceAll(body, rw.Replacement)
+			if strings.HasPrefix(rw.Type, "json:") {
+				path := rw.Type[5:]
+				if rw.Pattern.MatchString(gjson.GetBytes(body, path).String()) {
+					replaced, err := sjson.SetBytes(body, path, string(rw.Replacement))
+					if err == nil {
+						body = replaced
+					}
+				}
+			} else {
+				body = rw.Pattern.ReplaceAll(body, rw.Replacement)
+			}
 		}
 	}
 	return body, nil
+}
+
+// shouldApply reports whether a rewrite rule's configured type matches the
+// actual request Content-Type. A type prefix "json:" matches only
+// "application/json" content. An empty type defaults to "text/html", or "*"
+// when a Rewriter is set.
+func shouldApply(configuredType, actualContentType string, hasRewriter bool) bool {
+	t := configuredType
+	if t == "" {
+		if hasRewriter {
+			t = "*"
+		} else {
+			t = "text/html"
+		}
+	}
+	if strings.HasPrefix(t, "json:") {
+		return actualContentType == "application/json"
+	}
+	return t == "*" || strings.Contains(t, actualContentType)
 }

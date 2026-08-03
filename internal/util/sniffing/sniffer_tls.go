@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/hex"
-	"errors"
 	"io"
 	"net"
 	"time"
@@ -53,9 +52,9 @@ func (h *Sniffer) HandleTLS(ctx context.Context, network string, conn net.Conn, 
 		if log != nil {
 			log.Debugf("no sni in clienthello from %s", conn.RemoteAddr())
 		}
-		return errors.New("tls: sni is empty, closing connection")
+	} else {
+		ro.Host = host
 	}
-	ro.Host = host
 
 	if ho.bypass != nil && ho.bypass.Contains(ctx, network, host, bypass.WithService(ho.service)) {
 		return xbypass.ErrBypass

@@ -55,6 +55,7 @@ type HTTPRecorderObject struct {
 	Proto      string                     `json:"proto"`
 	Scheme     string                     `json:"scheme"`
 	URI        string                     `json:"uri"`
+	Cached     bool                       `json:"cached"`
 	StatusCode int                        `json:"statusCode"`
 	Request    HTTPRequestRecorderObject  `json:"request"`
 	Response   HTTPResponseRecorderObject `json:"response"`
@@ -113,6 +114,12 @@ type DNSRecorderObject struct {
 	Cached   bool   `json:"cached"`
 }
 
+// RedisRecorderObject holds the recorded data of a sniffed Redis command.
+type RedisRecorderObject struct {
+	Command string `json:"command"`
+	Key     string `json:"key"`
+}
+
 // HandlerRecorderObject bundles traffic metadata recorded at the handler
 // level — addresses, protocols, transferred bytes, and optional sub-records
 // for HTTP, WebSocket, TLS, and DNS traffic.
@@ -134,6 +141,7 @@ type HandlerRecorderObject struct {
 	Websocket   *WebsocketRecorderObject `json:"websocket,omitempty"`
 	TLS         *TLSRecorderObject       `json:"tls,omitempty"`
 	DNS         *DNSRecorderObject       `json:"dns,omitempty"`
+	Redis       *RedisRecorderObject     `json:"redis,omitempty"`
 	Route       string                   `json:"route,omitempty"`
 	InputBytes  uint64                   `json:"inputBytes"`
 	OutputBytes uint64                   `json:"outputBytes"`
@@ -142,12 +150,13 @@ type HandlerRecorderObject struct {
 	SID         string                   `json:"sid"`
 	Duration    time.Duration            `json:"duration"`
 	Time        time.Time                `json:"time"`
+	RecordMode  string                   `json:"-"` // "" = full, "headers" = metadata only, "off" = no recording
 }
 
 // Record serializes the HandlerRecorderObject as JSON and writes it to r.
 // It returns nil if p or r is nil or if p.Time is the zero value.
 func (p *HandlerRecorderObject) Record(ctx context.Context, r recorder.Recorder) error {
-	if p == nil || r == nil || p.Time.IsZero() {
+	if p == nil || r == nil || p.Time.IsZero() || p.RecordMode == "off" {
 		return nil
 	}
 

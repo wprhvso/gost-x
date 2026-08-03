@@ -21,6 +21,7 @@ import (
 	xctx "github.com/go-gost/x/ctx"
 	ictx "github.com/go-gost/x/internal/ctx"
 	xnet "github.com/go-gost/x/internal/net"
+	"github.com/go-gost/x/internal/util/httpcache"
 	"github.com/go-gost/x/internal/util/sniffing"
 	tls_util "github.com/go-gost/x/internal/util/tls"
 	traffic_wrapper "github.com/go-gost/x/limiter/traffic/wrapper"
@@ -79,6 +80,7 @@ func (h *httpHandler) handleConnect(ctx context.Context, conn net.Conn, ro *xrec
 	if h.md.sniffing {
 		snifferHandled, err = h.sniffAndHandle(ctx, conn, cc, ro, log)
 		if snifferHandled {
+			ro.Time = time.Time{}
 			return err
 		}
 	}
@@ -142,6 +144,13 @@ func (h *httpHandler) sniffAndHandle(ctx context.Context, conn net.Conn, cc net.
 			sniffing.WithDial(dial),
 			sniffing.WithDialTLS(dialTLS),
 			sniffing.WithBypass(h.options.Bypass),
+			sniffing.WithRecorderObject(ro),
+			sniffing.WithLog(log),
+		)
+	case sniffing.ProtoRedis:
+		return true, sniffer.HandleRedis(ctx, "tcp", conn,
+			sniffing.WithService(h.options.Service),
+			sniffing.WithDial(dial),
 			sniffing.WithRecorderObject(ro),
 			sniffing.WithLog(log),
 		)
@@ -236,6 +245,8 @@ type SnifferBuilder struct {
 	// and TLS ServerHello during sniffing. Passed through to sniffing.Sniffer.
 	// See sniffing.Sniffer.ReadTimeout for details.
 	ReadTimeout time.Duration
+	// Cache is the HTTP response cache (nil when caching is disabled).
+	Cache *httpcache.Cache
 }
 
 // Build creates a new sniffing.Sniffer from the builder's configuration.
@@ -251,5 +262,6 @@ func (b *SnifferBuilder) Build() *sniffing.Sniffer {
 		CertPool:            b.CertPool,
 		MitmBypass:          b.MitmBypass,
 		ReadTimeout:         b.ReadTimeout,
+		Cache:               b.Cache,
 	}
 }

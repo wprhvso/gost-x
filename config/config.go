@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"io"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v3"
 )
@@ -322,6 +324,33 @@ type RewriterConfig struct {
 	Plugin *PluginConfig `yaml:",omitempty" json:"plugin,omitempty"`
 }
 
+// CacheConfig defines a named cache store. Memory and Redis backends are
+// supported; other backends (file, plugin) are follow-ups.
+type CacheConfig struct {
+	Name   string       `json:"name"`
+	Memory *MemoryCache `yaml:",omitempty" json:"memory,omitempty"`
+	Redis  *RedisCache  `yaml:",omitempty" json:"redis,omitempty"`
+}
+
+// RedisCache configures the Redis cache backend.
+type RedisCache struct {
+	Addr     string        `json:"addr"`
+	DB       int           `yaml:",omitempty" json:"db,omitempty"`
+	Username string        `yaml:",omitempty" json:"username,omitempty"`
+	Password string        `yaml:",omitempty" json:"password,omitempty"`
+	TTL      time.Duration `yaml:",omitempty" json:"ttl,omitempty"`
+	Key      string        `yaml:",omitempty" json:"key,omitempty"` // key prefix, default "gost:cache:"
+}
+
+// MemoryCache configures the in-memory cache backend.
+type MemoryCache struct {
+	TTL             time.Duration `yaml:",omitempty" json:"ttl,omitempty"`
+	MaxSize         int           `yaml:"maxSize,omitempty" json:"maxSize,omitempty"`
+	MaxBytes        int64         `yaml:"maxBytes,omitempty" json:"maxBytes,omitempty"`
+	CleanupInterval time.Duration `yaml:"cleanupInterval,omitempty" json:"cleanupInterval,omitempty"`
+	Eviction        string        `yaml:",omitempty" json:"eviction,omitempty"` // "oldest" | "lru"
+}
+
 type LimiterConfig struct {
 	Name   string        `json:"name"`
 	Limits []string      `yaml:",omitempty" json:"limits,omitempty"`
@@ -366,9 +395,21 @@ type ForwarderConfig struct {
 	// Deprecated: use hop instead
 	Name string `yaml:",omitempty" json:"name,omitempty"`
 	// the referenced hop name
-	Hop      string               `yaml:",omitempty" json:"hop,omitempty"`
-	Selector *SelectorConfig      `yaml:",omitempty" json:"selector,omitempty"`
-	Nodes    []*ForwardNodeConfig `json:"nodes"`
+	Hop      string                 `yaml:",omitempty" json:"hop,omitempty"`
+	Selector *SelectorConfig        `yaml:",omitempty" json:"selector,omitempty"`
+	Nodes    []*ForwardNodeConfig   `json:"nodes"`
+	HopGroup *ForwardHopGroupConfig `yaml:"hopGroup,omitempty" json:"hopGroup,omitempty"`
+}
+
+type ForwardHopGroupConfig struct {
+	Hops     []*ForwardHopConfig `yaml:",omitempty" json:"hops,omitempty"`
+	Selector *SelectorConfig     `yaml:",omitempty" json:"selector,omitempty"`
+}
+
+type ForwardHopConfig struct {
+	Hop     string             `yaml:",omitempty" json:"hop,omitempty"`
+	Matcher *NodeMatcherConfig `yaml:",omitempty" json:"matcher,omitempty"`
+	Probe   *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
 }
 
 type ForwardNodeConfig struct {
@@ -428,9 +469,9 @@ type NodeMatcherConfig struct {
 	Rule     string `yaml:",omitempty" json:"rule,omitempty"`
 	Priority int    `yaml:",omitempty" json:"priority,omitempty"`
 	// BodySize is the max request body prefix (bytes) exposed to BodyRegexp
-	// matchers. 0 (default) disables body reading for this node. Capped at
-	// chain.MaxMatcherBodySize. Only takes effect under an HTTP sniffing handler
-	// whose sniffer reads the body prefix before node selection.
+	// and BodyJSON matchers. 0 (default) uses DefaultMatcherBodySize (1MB).
+	// Capped at MaxMatcherBodySize (10MB). Only takes effect under an HTTP
+	// sniffing handler whose sniffer reads the body prefix before node selection.
 	BodySize int `yaml:",omitempty" json:"bodySize,omitempty"`
 }
 
@@ -466,6 +507,9 @@ type HTTPNodeConfig struct {
 	RewriteRequestBody []HTTPBodyRewriteConfig `yaml:"rewriteRequestBody,omitempty" json:"rewriteRequestBody,omitempty"`
 	// rewrite response body
 	RewriteResponseBody []HTTPBodyRewriteConfig `yaml:"rewriteResponseBody,omitempty" json:"rewriteResponseBody,omitempty"`
+
+	// comma-separated response status codes marking the node failed, e.g. "429,5xx"
+	FailCodes string `yaml:"failCodes,omitempty" json:"failCodes,omitempty"`
 
 	// HTTP basic auth
 	Auth *AuthConfig `yaml:",omitempty" json:"auth,omitempty"`
@@ -517,6 +561,7 @@ type ServiceConfig struct {
 	Observer   string            `yaml:",omitempty" json:"observer,omitempty"`
 	Rewriter   string            `yaml:",omitempty" json:"rewriter,omitempty"`
 	Recorders  []*RecorderObject `yaml:",omitempty" json:"recorders,omitempty"`
+	Cache      string            `yaml:",omitempty" json:"cache,omitempty"`
 	Handler    *HandlerConfig    `yaml:",omitempty" json:"handler,omitempty"`
 	Listener   *ListenerConfig   `yaml:",omitempty" json:"listener,omitempty"`
 	Forwarder  *ForwarderConfig  `yaml:",omitempty" json:"forwarder,omitempty"`
@@ -604,9 +649,39 @@ type ChainConfig struct {
 	Metadata map[string]any `yaml:",omitempty" json:"metadata,omitempty"`
 }
 
+type ChainGroupEntry struct {
+	Chain   string             `yaml:",omitempty" json:"chain,omitempty"`
+	Matcher *NodeMatcherConfig `yaml:",omitempty" json:"matcher,omitempty"`
+	Probe   *ProbeConfig       `yaml:",omitempty" json:"probe,omitempty"`
+}
+
+// gostDecodeHook is a composite mapstructure decode hook that handles custom
+// type conversions needed by GOST config fields. viper's internal unmarshalling
+// never calls yaml.Unmarshaler / json.Unmarshaler on leaf types, so the hook is
+// the only way to support these.
+func gostDecodeHook() mapstructure.DecodeHookFunc {
+	return func(f, t reflect.Type, data any) (any, error) {
+		// Plain string → ChainGroupEntry: backward compat for "chains: [a, b]".
+		if t == reflect.TypeOf(ChainGroupEntry{}) {
+			if s, ok := data.(string); ok {
+				return ChainGroupEntry{Chain: s}, nil
+			}
+			return data, nil
+		}
+		// String → time.Duration: accept "10s", "1m", etc. in YAML/JSON.
+		if t == reflect.TypeOf(time.Duration(0)) {
+			if s, ok := data.(string); ok {
+				return time.ParseDuration(s)
+			}
+			return data, nil
+		}
+		return data, nil
+	}
+}
+
 type ChainGroupConfig struct {
-	Chains   []string        `yaml:",omitempty" json:"chains,omitempty"`
-	Selector *SelectorConfig `yaml:",omitempty" json:"selector,omitempty"`
+	Chains   []*ChainGroupEntry `yaml:",omitempty" json:"chains,omitempty"`
+	Selector *SelectorConfig    `yaml:",omitempty" json:"selector,omitempty"`
 }
 
 type HopConfig struct {
@@ -668,6 +743,7 @@ type Config struct {
 	SDs        []*SDConfig        `yaml:"sds,omitempty" json:"sds,omitempty"`
 	Recorders  []*RecorderConfig  `yaml:",omitempty" json:"recorders,omitempty"`
 	Rewriters  []*RewriterConfig  `yaml:",omitempty" json:"rewriters,omitempty"`
+	Caches     []*CacheConfig     `yaml:",omitempty" json:"caches,omitempty"`
 	Limiters   []*LimiterConfig   `yaml:",omitempty" json:"limiters,omitempty"`
 	Quotas     []*QuotaConfig     `yaml:",omitempty" json:"quotas,omitempty"`
 	CLimiters  []*LimiterConfig   `yaml:"climiters,omitempty" json:"climiters,omitempty"`
@@ -686,7 +762,7 @@ func (c *Config) Load() error {
 		return err
 	}
 
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) Read(r io.Reader, configType string) error {
@@ -695,7 +771,7 @@ func (c *Config) Read(r io.Reader, configType string) error {
 		return err
 	}
 
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) ReadFile(file string) error {
@@ -704,7 +780,7 @@ func (c *Config) ReadFile(file string) error {
 	if err := v.ReadInConfig(); err != nil {
 		return err
 	}
-	return v.Unmarshal(c)
+	return v.Unmarshal(c, viper.DecodeHook(gostDecodeHook()))
 }
 
 func (c *Config) Write(w io.Writer, format string) error {
