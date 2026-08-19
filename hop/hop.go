@@ -22,6 +22,7 @@ import (
 	"github.com/go-gost/core/routing"
 	"github.com/go-gost/core/selector"
 	"github.com/go-gost/x/config"
+	xs "github.com/go-gost/x/selector"
 	mdutil "github.com/go-gost/x/metadata/util"
 	node_parser "github.com/go-gost/x/config/parsing/node"
 	"github.com/go-gost/x/internal/loader"
@@ -33,6 +34,12 @@ type options struct {
 	nodes       []*chain.Node
 	bypass      bypass.Bypass
 	selector    selector.Selector[*chain.Node]
+	// failMaxFails / failTimeout mirror the FailFilter config used by the
+	// selector. Node selection consults them via selector.IsFailed to skip
+	// nodes currently marked failed (FailFilter itself no-ops on a single
+	// node, so the marker is checked here instead).
+	failMaxFails int
+	failTimeout  time.Duration
 	fileLoader  loader.Loader
 	redisLoader loader.Loader
 	httpLoader  loader.Loader
@@ -68,6 +75,16 @@ func BypassOption(bp bypass.Bypass) Option {
 func SelectorOption(s selector.Selector[*chain.Node]) Option {
 	return func(o *options) {
 		o.selector = s
+	}
+}
+
+// FailFilterSettingsOption sets the maxFails/failTimeout used by the hop's
+// FailFilter. The pre-selection dead-node filter consults these to decide
+// whether a node is currently marked failed.
+func FailFilterSettingsOption(maxFails int, timeout time.Duration) Option {
+	return func(o *options) {
+		o.failMaxFails = maxFails
+		o.failTimeout = timeout
 	}
 }
 
@@ -192,40 +209,26 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		maxPriCount  int
 		maxPriNode   *chain.Node
 		hasBackup    bool
+		sawFailed    bool
 	)
 	for _, node := range p.Nodes() {
 		if node == nil {
 			continue
 		}
-		// node level bypass
-		if node.Options().Bypass != nil &&
-			node.Options().Bypass.Contains(ctx, options.Network, options.Addr, bypass.WithHostOption(options.Host)) {
+		// A node currently marked failed (http.failCodes match, probe failure)
+		// is never selected, regardless of its priority or matcher. Checked
+		// before the eligibility gates so failed nodes skip matcher evaluation
+		// (body matching reads a large request prefix) and never reach the
+		// priority short-circuit.
+		if xs.IsFailed(node, p.options.failMaxFails, p.options.failTimeout) {
+			sawFailed = true
 			continue
 		}
-
+		if !p.nodeMatches(ctx, node, &options) {
+			continue
+		}
 		if matcher := node.Options().Matcher; matcher != nil {
-			// Gate 2a: routing.Matcher — boolean expression on HTTP-level fields.
-			// A match assigns a non-zero Priority (from rule specificity).
-			req := routing.Request{
-				ClientIP: options.ClientIP,
-				Network:  options.Network,
-				Host:     options.Host,
-				Protocol: options.Protocol,
-				Method:   options.Method,
-				Path:     options.Path,
-				Query:    options.Query,
-				Header:   options.Header,
-				Body:     options.Body,
-			}
-			if !matcher.Match(&req) {
-				continue
-			}
-			log.Debugf("node %s match request %s %s, priority %d", node.Name, req.Protocol, req.Host, node.Options().Priority)
-		} else {
-			// Gate 2b: fallback eligibility — simple host/protocol/path filters.
-			if !p.isEligible(node, &options) {
-				continue
-			}
+			log.Debugf("node %s match request %s %s, priority %d", node.Name, options.Protocol, options.Host, node.Options().Priority)
 		}
 
 		pri := node.Options().Priority
@@ -244,6 +247,22 @@ func (p *chainHop) Select(ctx context.Context, opts ...hop.SelectOption) *chain.
 		nodes = append(nodes, node)
 	}
 	if len(nodes) == 0 {
+		if sawFailed {
+			// All candidates are marked failed. Best-effort last resort: return
+			// the first candidate that matches this request, so a transient
+			// failure (e.g. a single 429) doesn't take the hop fully down — a
+			// successful dial in the caller resets the marker, so the node
+			// recovers as soon as it works again. Requests matching no node
+			// still yield nil (no route).
+			for _, node := range p.Nodes() {
+				if node != nil &&
+					xs.IsFailed(node, p.options.failMaxFails, p.options.failTimeout) &&
+					p.nodeMatches(ctx, node, &options) {
+					log.Debugf("last resort: node %s selected (all candidates failed)", node.Name)
+					return node
+				}
+			}
+		}
 		return nil
 	}
 	if len(nodes) == 1 {
@@ -339,6 +358,34 @@ func (p *chainHop) isEligible(node *chain.Node, opts *hop.SelectOptions) bool {
 		return false
 	}
 	return true
+}
+
+// nodeMatches reports whether node passes the per-node bypass and
+// matcher/eligible gates for the given selection options. Shared by the
+// candidate-pool scan and the all-failed last-resort fallback.
+func (p *chainHop) nodeMatches(ctx context.Context, node *chain.Node, opts *hop.SelectOptions) bool {
+	if node == nil {
+		return false
+	}
+	if node.Options().Bypass != nil &&
+		node.Options().Bypass.Contains(ctx, opts.Network, opts.Addr, bypass.WithHostOption(opts.Host)) {
+		return false
+	}
+	if matcher := node.Options().Matcher; matcher != nil {
+		req := routing.Request{
+			ClientIP: opts.ClientIP,
+			Network:  opts.Network,
+			Host:     opts.Host,
+			Protocol: opts.Protocol,
+			Method:   opts.Method,
+			Path:     opts.Path,
+			Query:    opts.Query,
+			Header:   opts.Header,
+			Body:     opts.Body,
+		}
+		return matcher.Match(&req)
+	}
+	return p.isEligible(node, opts)
 }
 
 func (p *chainHop) checkHost(host string, node *chain.Node) bool {

@@ -1765,10 +1765,10 @@ func TestBuildNodeConfig_TLSWithCert(t *testing.T) {
 	}
 }
 
-func TestBuildNodeConfig_UnixFallsBackToTCP(t *testing.T) {
+func TestBuildNodeConfig_UnixAbsolutePath(t *testing.T) {
 	// http+unix scheme: connector=http, dialer=unix.
-	// Since unix is not in the test registry, dialer falls back to tcp,
-	// and the path-based address logic (dialer=="unix") is skipped.
+	// Dialer falls back to tcp when unix is not in the test registry, but
+	// the absolute socket path from a three-slash URL must still be kept.
 	rawURL := "http+unix:///var/run/socket"
 	u, _ := url.Parse(rawURL)
 
@@ -1780,11 +1780,67 @@ func TestBuildNodeConfig_UnixFallsBackToTCP(t *testing.T) {
 	if node.Dialer.Type != "tcp" {
 		t.Errorf("Dialer.Type = %q, want tcp (unix not in test registry)", node.Dialer.Type)
 	}
-	// Addr is url.Host ("") since no host component in three-slash unix URL
-	if node.Addr != "" {
-		t.Errorf("Addr = %q, want empty", node.Addr)
+	if node.Addr != "/var/run/socket" {
+		t.Errorf("Addr = %q, want /var/run/socket", node.Addr)
 	}
 }
+
+func TestBuildNodeConfig_UnixRelativeHost(t *testing.T) {
+	u, _ := url.Parse("unix://docker.sock")
+	node, err := buildNodeConfig(u, map[string]any{})
+	if err != nil {
+		t.Fatalf("buildNodeConfig: %v", err)
+	}
+	if node.Addr != "docker.sock" {
+		t.Errorf("Addr = %q, want docker.sock", node.Addr)
+	}
+}
+
+func TestBuildServiceConfig_UnixAbsolutePath(t *testing.T) {
+	// three-slash: path is the absolute socket listen address, no forward target
+	svcs, err := buildServiceConfig(mustURL("unix:///var/run/gost.sock"))
+	if err != nil {
+		t.Fatalf("buildServiceConfig: %v", err)
+	}
+	if len(svcs) != 1 {
+		t.Fatalf("len(svcs) = %d, want 1", len(svcs))
+	}
+	if svcs[0].Addr != "/var/run/gost.sock" {
+		t.Errorf("Addr = %q, want /var/run/gost.sock", svcs[0].Addr)
+	}
+	if svcs[0].Forwarder != nil {
+		t.Errorf("Forwarder = %+v, want nil (no forward target)", svcs[0].Forwarder)
+	}
+}
+
+func TestBuildServiceConfig_UnixPortForward(t *testing.T) {
+	// two-slash: host is the listen socket, path is a forward target socket
+	svcs, err := buildServiceConfig(mustURL("unix://gost.sock/gost2.sock"))
+	if err != nil {
+		t.Fatalf("buildServiceConfig: %v", err)
+	}
+	if len(svcs) != 1 {
+		t.Fatalf("len(svcs) = %d, want 1", len(svcs))
+	}
+	if svcs[0].Addr != "gost.sock" {
+		t.Errorf("Addr = %q, want gost.sock", svcs[0].Addr)
+	}
+	if svcs[0].Forwarder == nil || len(svcs[0].Forwarder.Nodes) == 0 {
+		t.Fatalf("Forwarder = %+v, want a forward target node", svcs[0].Forwarder)
+	}
+	if got := svcs[0].Forwarder.Nodes[0].Addr; got != "gost2.sock" {
+		t.Errorf("forward Addr = %q, want gost2.sock", got)
+	}
+}
+
+func mustURL(raw string) *url.URL {
+	u, err := url.Parse(raw)
+	if err != nil {
+		panic(err)
+	}
+	return u
+}
+
 
 func TestBuildServiceConfig_RelayTLSForward(t *testing.T) {
 	// relay+tls scheme: handler=relay, listener=tls.
