@@ -25,7 +25,20 @@ func (c *conn) Read(b []byte) (n int, err error) {
 	return c.r.Read(b)
 }
 
+// Write holds the mutex for the whole write so that Close cannot signal the
+// HTTP handler to return while a write to the response writer is still in
+// flight: the handler goroutine and the writer would then race over the
+// response state.
 func (c *conn) Write(b []byte) (n int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+
 	return c.w.Write(b)
 }
 
